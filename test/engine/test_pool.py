@@ -2044,6 +2044,261 @@ class QueuePoolTest(PoolTestBase):
         pc1.close()
 
 
+class QueuePoolTenantQuotaTest(PoolTestBase):
+    def _tenant_pool_fixture(self, **kw):
+        kw.setdefault("pool_size", 3)
+        kw.setdefault("max_overflow", 0)
+        kw.setdefault("timeout", 1)
+        dbapi = MockDBAPI()
+        p = pool.QueuePool(creator=dbapi.connect, **kw)
+        return dbapi, p
+
+    def test_tenant_quotas_unconfigured_by_default(self):
+        dbapi, p = self._tenant_pool_fixture()
+        is_none(p.tenant_get_quota("tenant_a"))
+        eq_(p.tenant_quotas(), {})
+        eq_(p.tenant_usage("tenant_a"), 0)
+
+    def test_tenant_set_get_quota(self):
+        dbapi, p = self._tenant_pool_fixture()
+        p.tenant_set_quota("tenant_a", 2)
+        eq_(p.tenant_get_quota("tenant_a"), 2)
+        eq_(p.tenant_quotas(), {"tenant_a": 2})
+
+        p.tenant_set_quota("tenant_a", None)
+        is_none(p.tenant_get_quota("tenant_a"))
+        eq_(p.tenant_quotas(), {})
+
+    def test_tenant_set_quota_validation(self):
+        dbapi, p = self._tenant_pool_fixture()
+        assert_raises(ValueError, p.tenant_set_quota, "tenant_a", -1)
+        assert_raises(ValueError, p.tenant_set_quota, "tenant_a", 1.5)
+
+    def test_tenant_from_url(self):
+        eq_(
+            pool.QueuePool.tenant_from_url(
+                "postgresql+psycopg2://scott:tiger@dbhost:5432/tenant_a"
+                "?sslmode=require"
+            ),
+            "scott@dbhost:5432/tenant_a",
+        )
+        eq_(
+            pool.QueuePool.tenant_from_url("postgresql://dbhost/tenant_b"),
+            "@dbhost:/tenant_b",
+        )
+        eq_(
+            pool.QueuePool.tenant_from_url("sqlite:///somefile.db"),
+            "@:/somefile.db",
+        )
+
+    def test_tenant_from_url_object(self):
+        url = tsa.engine.make_url("mysql://u1@dbhost:3307/tenant_c")
+        eq_(pool.QueuePool.tenant_from_url(url), "u1@dbhost:3307/tenant_c")
+
+    def test_tenant_quota_blocks_excess_checkout(self):
+        dbapi, p = self._tenant_pool_fixture(pool_size=3, timeout=1)
+        p.tenant_set_quota("tenant_a", 1)
+
+        c1 = p.tenant_connect("tenant_a")
+        eq_(p.tenant_usage("tenant_a"), 1)
+
+        # quota is exhausted even though the pool itself still has
+        # free capacity
+        now = time.time()
+        assert_raises(tsa.exc.TimeoutError, p.tenant_connect, "tenant_a")
+        assert time.time() - now >= 1
+
+        # a tenant without a quota, as well as a plain checkout, are
+        # not affected
+        c2 = p.connect()
+        c3 = p.tenant_connect("tenant_b")
+        eq_(p.tenant_usage("tenant_b"), 0)
+        c2.close()
+        c3.close()
+        c1.close()
+
+    def test_tenant_quota_released_on_close(self):
+        dbapi, p = self._tenant_pool_fixture(pool_size=1)
+        p.tenant_set_quota("tenant_a", 1)
+
+        c1 = p.tenant_connect("tenant_a")
+        c1.close()
+        eq_(p.tenant_usage("tenant_a"), 0)
+
+        c2 = p.tenant_connect("tenant_a")
+        c2.close()
+        eq_(p.tenant_usage("tenant_a"), 0)
+
+    def test_tenant_quota_released_on_invalidate(self):
+        dbapi, p = self._tenant_pool_fixture(pool_size=1)
+        p.tenant_set_quota("tenant_a", 1)
+
+        c1 = p.tenant_connect("tenant_a")
+        c1.invalidate()
+        eq_(p.tenant_usage("tenant_a"), 0)
+
+        c2 = p.tenant_connect("tenant_a")
+        c2.close()
+
+    def test_tenant_quota_released_on_recycle(self):
+        dbapi, p = self._tenant_pool_fixture(pool_size=1)
+        p.tenant_set_quota("tenant_a", 1)
+
+        c1 = p.tenant_connect("tenant_a")
+        c1.close()
+        eq_(p.tenant_usage("tenant_a"), 0)
+
+        # force the connection to be recycled on next checkout; the
+        # replacement connection is still accounted to the tenant
+        p._invalidate_time = time.time() + 1
+        c2 = p.tenant_connect("tenant_a")
+        eq_(p.tenant_usage("tenant_a"), 1)
+        c2.close()
+        eq_(p.tenant_usage("tenant_a"), 0)
+
+    def test_tenant_quota_removed_restores_default(self):
+        dbapi, p = self._tenant_pool_fixture(pool_size=2)
+        p.tenant_set_quota("tenant_a", 1)
+        p.tenant_set_quota("tenant_a", None)
+
+        c1 = p.tenant_connect("tenant_a")
+        c2 = p.tenant_connect("tenant_a")
+        eq_(p.tenant_usage("tenant_a"), 0)
+        c1.close()
+        c2.close()
+
+    def test_tenant_connect_with_url(self):
+        dbapi, p = self._tenant_pool_fixture(pool_size=2)
+        url = tsa.engine.make_url("postgresql://u1@dbhost/tenant_a")
+        p.tenant_set_quota(url, 1)
+        eq_(p.tenant_get_quota("u1@dbhost:/tenant_a"), 1)
+
+        c1 = p.tenant_connect(url)
+        eq_(p.tenant_usage("u1@dbhost:/tenant_a"), 1)
+        c1.close()
+
+    def test_connect_tenant_kwarg(self):
+        dbapi, p = self._tenant_pool_fixture(pool_size=1)
+        p.tenant_set_quota("tenant_a", 1)
+
+        c1 = p.connect(tenant="tenant_a")
+        eq_(p.tenant_usage("tenant_a"), 1)
+        c1.close()
+        eq_(p.tenant_usage("tenant_a"), 0)
+
+    def test_tenant_quota_pool_capacity_unchanged(self):
+        # the overall capacity of the pool is still pool_size +
+        # max_overflow, shared by all tenants
+        dbapi, p = self._tenant_pool_fixture(
+            pool_size=1, max_overflow=1, timeout=1
+        )
+        p.tenant_set_quota("tenant_a", 5)
+
+        c1 = p.tenant_connect("tenant_a")
+        c2 = p.tenant_connect("tenant_a")
+        eq_(p.tenant_usage("tenant_a"), 2)
+
+        # tenant_a is below its quota, but the pool itself is full
+        now = time.time()
+        assert_raises(tsa.exc.TimeoutError, p.connect)
+        assert time.time() - now >= 1
+        c1.close()
+        c2.close()
+
+    def test_tenant_quota_recreate(self):
+        dbapi, p = self._tenant_pool_fixture()
+        p.tenant_set_quota("tenant_a", 2)
+        p2 = p.recreate()
+        eq_(p2.tenant_get_quota("tenant_a"), 2)
+
+    @testing.requires.threading_with_mock
+    def test_tenant_waiter_does_not_block_others(self):
+        # a tenant that is at its quota waits without preventing other
+        # checkouts from proceeding
+        dbapi, p = self._tenant_pool_fixture(pool_size=2, timeout=3)
+        p.tenant_set_quota("tenant_a", 1)
+
+        c1 = p.tenant_connect("tenant_a")
+
+        tenant_a_errors = []
+
+        def tenant_a_checkout():
+            try:
+                p.tenant_connect("tenant_a")
+            except tsa.exc.TimeoutError:
+                tenant_a_errors.append(True)
+
+        th = threading.Thread(target=tenant_a_checkout)
+        th.start()
+        time.sleep(0.2)
+
+        # while the tenant_a checkout is waiting on the quota, another
+        # checkout gets a connection right away
+        now = time.time()
+        c2 = p.connect()
+        elapsed = time.time() - now
+        assert elapsed < 1, "plain checkout was blocked for %r" % elapsed
+        c2.close()
+
+        th.join(join_timeout)
+        eq_(tenant_a_errors, [True])
+        c1.close()
+
+    @testing.requires.threading_with_mock
+    def test_tenant_waiter_woken_on_return(self):
+        # returning a connection releases the tenant's quota slot and
+        # wakes up the tenant's waiters immediately
+        dbapi, p = self._tenant_pool_fixture(pool_size=2, timeout=5)
+        p.tenant_set_quota("tenant_a", 1)
+
+        c1 = p.tenant_connect("tenant_a")
+
+        checked_out = []
+
+        def tenant_a_checkout():
+            checked_out.append(p.tenant_connect("tenant_a"))
+
+        th = threading.Thread(target=tenant_a_checkout)
+        started = time.time()
+        th.start()
+        time.sleep(0.5)
+        c1.close()
+        th.join(join_timeout)
+        elapsed = time.time() - started
+
+        eq_(len(checked_out), 1)
+        assert elapsed < 4, "waiter was not woken promptly: %r" % elapsed
+        eq_(p.tenant_usage("tenant_a"), 1)
+        checked_out[0].close()
+        eq_(p.tenant_usage("tenant_a"), 0)
+
+    @testing.requires.threading_with_mock
+    def test_tenant_timeout_is_single_deadline(self):
+        # the pool timeout is one deadline for the whole checkout: time
+        # spent waiting for the tenant quota is not re-budgeted when
+        # the checkout then waits for a pooled connection
+        dbapi, p = self._tenant_pool_fixture(
+            pool_size=1, max_overflow=0, timeout=2
+        )
+        p.tenant_set_quota("tenant_a", 1)
+
+        c1 = p.tenant_connect("tenant_a")
+
+        # hold the connection past the timeout; the waiter must time
+        # out at ~timeout, not at ~2 * timeout
+        def return_conn():
+            time.sleep(3)
+            c1.close()
+
+        th = threading.Thread(target=return_conn)
+        now = time.time()
+        th.start()
+        assert_raises(tsa.exc.TimeoutError, p.tenant_connect, "tenant_a")
+        elapsed = time.time() - now
+        assert 2 <= elapsed < 3.5, "timeout was %r" % elapsed
+        th.join(join_timeout)
+
+
 class ResetOnReturnTest(PoolTestBase):
     def _fixture(self, **kw):
         dbapi = Mock()

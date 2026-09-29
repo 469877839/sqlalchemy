@@ -11,10 +11,12 @@
 from __future__ import annotations
 
 import threading
+import time
 import traceback
 import typing
 from typing import Any
 from typing import cast
+from typing import Dict
 from typing import List
 from typing import Literal
 from typing import Optional
@@ -39,6 +41,7 @@ from ..util import queue as sqla_queue
 
 if typing.TYPE_CHECKING:
     from ..engine.interfaces import DBAPIConnection
+    from ..engine.url import URL
 
 
 class QueuePool(Pool):
@@ -55,9 +58,15 @@ class QueuePool(Pool):
     using :func:`_asyncio.create_async_engine`, if no other kind of pool
     is specified.
 
+    Optionally, a per-tenant quota may be configured that limits how
+    many connections a single tenant may hold at the same time; see
+    :meth:`.QueuePool.tenant_set_quota`.
+
     .. seealso::
 
         :class:`.AsyncAdaptedQueuePool`
+
+        :ref:`pool_tenant_quotas`
 
     """
 
@@ -137,8 +146,17 @@ class QueuePool(Pool):
         self._max_overflow = -1 if pool_size == 0 else max_overflow
         self._timeout = timeout
         self._overflow_lock = threading.Lock()
+        self._tenant_quotas: Dict[str, int] = {}
+        self._tenant_checked_out: Dict[str, int] = {}
+        self._tenant_condition = threading.Condition()
 
     def _do_return_conn(self, record: ConnectionPoolEntry) -> None:
+        tenant = getattr(record, "_tenant", None)
+        if tenant is not None:
+            # clear the tag while the record is still exclusively owned
+            # by the returning thread, i.e. before it becomes visible to
+            # other threads via the queue.
+            cast(Any, record)._tenant = None
         try:
             self._pool.put(record, False)
         except sqla_queue.Full:
@@ -146,13 +164,26 @@ class QueuePool(Pool):
                 record.close()
             finally:
                 self._dec_overflow()
+        if tenant is not None:
+            # release the tenant's slot only after the connection itself
+            # has been returned, so that a woken tenant waiter finds the
+            # pool state already updated.
+            with self._tenant_condition:
+                self._release_tenant_slot(tenant)
 
-    def _do_get(self) -> ConnectionPoolEntry:
+    def _do_get(
+        self, _deadline: Optional[float] = None
+    ) -> ConnectionPoolEntry:
         use_overflow = self._max_overflow > -1
+
+        if _deadline is None:
+            timeout = self._timeout
+        else:
+            timeout = max(0.0, _deadline - time.time())
 
         wait = use_overflow and self._overflow >= self._max_overflow
         try:
-            return self._pool.get(wait, self._timeout)
+            return self._pool.get(wait, timeout)
         except sqla_queue.Empty:
             # don't do things inside of "except Empty", because when we say
             # we timed out or can't connect and raise, Python 3 tells
@@ -160,7 +191,7 @@ class QueuePool(Pool):
             pass
         if use_overflow and self._overflow >= self._max_overflow:
             if not wait:
-                return self._do_get()
+                return self._do_get(_deadline)
             else:
                 raise exc.TimeoutError(
                     "QueuePool limit of size %d overflow %d reached, "
@@ -177,7 +208,64 @@ class QueuePool(Pool):
                     self._dec_overflow()
                 raise
         else:
+            return self._do_get(_deadline)
+
+    def _do_get_tenant(self, tenant: str) -> ConnectionPoolEntry:
+        if self._is_asyncio:
+            raise exc.InvalidRequestError(
+                "Per-tenant connection quotas are not supported by the "
+                "AsyncAdaptedQueuePool class."
+            )
+
+        if not self._tenant_quotas:
+            # no quotas configured at all; use the regular checkout
+            # path without touching any tenant state.
             return self._do_get()
+
+        deadline = time.time() + self._timeout
+        reserved = False
+        with self._tenant_condition:
+            while True:
+                quota = self._tenant_quotas.get(tenant)
+                if quota is None:
+                    # no quota configured for this tenant; use the
+                    # regular checkout path below.
+                    break
+                checked_out = self._tenant_checked_out.get(tenant, 0)
+                if checked_out < quota:
+                    self._tenant_checked_out[tenant] = checked_out + 1
+                    reserved = True
+                    break
+                remaining = deadline - time.time()
+                if remaining <= 0.0:
+                    raise exc.TimeoutError(
+                        "QueuePool tenant quota for tenant %r of %d "
+                        "connections reached, connection timed out, "
+                        "timeout %0.2f" % (tenant, quota, self._timeout),
+                        code="3o7r",
+                    )
+                self._tenant_condition.wait(remaining)
+
+        if not reserved:
+            return self._do_get()
+
+        try:
+            rec = self._do_get(_deadline=deadline)
+        except BaseException:
+            with self._tenant_condition:
+                self._release_tenant_slot(tenant)
+            raise
+        cast(Any, rec)._tenant = tenant
+        return rec
+
+    def _release_tenant_slot(self, tenant: str) -> None:
+        # caller must hold self._tenant_condition
+        remaining = self._tenant_checked_out.get(tenant, 0) - 1
+        if remaining > 0:
+            self._tenant_checked_out[tenant] = remaining
+        else:
+            self._tenant_checked_out.pop(tenant, None)
+        self._tenant_condition.notify_all()
 
     def _inc_overflow(self) -> bool:
         if self._max_overflow == -1:
@@ -198,9 +286,164 @@ class QueuePool(Pool):
             self._overflow -= 1
             return True
 
+    @staticmethod
+    def tenant_from_url(url: Union[str, URL]) -> str:
+        """Derive the tenant identifier used by the per-tenant quota
+        system from a database URL.
+
+        The identifier is built from the URL's ``username``, ``host``,
+        ``port`` and ``database`` attributes, joined as
+        ``"<username>@<host>:<port>/<database>"``.  Components that are
+        not present in the URL are rendered as empty strings.  The
+        password, the drivername and the query string are intentionally
+        not part of the identifier: the password is a secret, and two
+        URLs that differ only by driver or query parameters still reach
+        the same tenant database.
+
+        :param url: a :class:`_engine.URL` object, or a string that can
+         be parsed into one.
+
+        .. seealso::
+
+            :ref:`pool_tenant_quotas`
+
+        """
+        if isinstance(url, str):
+            from ..engine.url import make_url
+
+            url = make_url(url)
+        return "%s@%s:%s/%s" % (
+            url.username or "",
+            url.host or "",
+            url.port if url.port is not None else "",
+            url.database or "",
+        )
+
+    @staticmethod
+    def _tenant_id(tenant: Union[str, URL]) -> str:
+        if isinstance(tenant, str):
+            return tenant
+        else:
+            return QueuePool.tenant_from_url(tenant)
+
+    def tenant_set_quota(
+        self, tenant: Union[str, URL], quota: Optional[int]
+    ) -> None:
+        """Set the per-tenant quota for simultaneous checked out
+        connections.
+
+        The quota caps how many connections the given tenant may hold
+        at the same time.  The pool's overall capacity is unchanged;
+        it remains ``pool_size + max_overflow`` shared by all tenants.
+
+        :param tenant: the tenant identifier, as a string or as a
+         :class:`_engine.URL` from which the identifier is derived via
+         :meth:`.QueuePool.tenant_from_url`.
+        :param quota: a non-negative integer, or ``None`` to remove the
+         quota for the tenant, restoring the default unlimited
+         behavior.  A quota of zero prevents the tenant from checking
+         out any connection.
+
+        Tenants for which no quota is set are not tracked and use the
+        same checkout path as a pool without any quotas.  Quotas should
+        normally be configured before the pool starts serving traffic;
+        changing a quota does not affect connections that are already
+        checked out.
+
+        """
+        tenant = self._tenant_id(tenant)
+        if quota is not None and (not isinstance(quota, int) or quota < 0):
+            raise ValueError(
+                "tenant quota must be a non-negative integer or None"
+            )
+        with self._tenant_condition:
+            if quota is None:
+                self._tenant_quotas.pop(tenant, None)
+            else:
+                self._tenant_quotas[tenant] = quota
+            # wake tenant waiters so they re-evaluate the new quota
+            self._tenant_condition.notify_all()
+
+    def tenant_get_quota(self, tenant: Union[str, URL]) -> Optional[int]:
+        """Return the quota configured for the given tenant, or ``None``
+        if no quota is set.
+
+        :param tenant: the tenant identifier, as a string or as a
+         :class:`_engine.URL`.
+
+        """
+        tenant = self._tenant_id(tenant)
+        with self._tenant_condition:
+            return self._tenant_quotas.get(tenant)
+
+    def tenant_quotas(self) -> Dict[str, int]:
+        """Return a dictionary of all currently configured tenant
+        quotas, mapping tenant identifier to quota."""
+        with self._tenant_condition:
+            return dict(self._tenant_quotas)
+
+    def tenant_usage(self, tenant: Union[str, URL]) -> int:
+        """Return the number of connections currently checked out by
+        the given tenant.
+
+        Usage is only tracked for tenants that have a quota configured;
+        for all other tenants this method returns zero.
+
+        :param tenant: the tenant identifier, as a string or as a
+         :class:`_engine.URL`.
+
+        """
+        tenant = self._tenant_id(tenant)
+        with self._tenant_condition:
+            return self._tenant_checked_out.get(tenant, 0)
+
+    def tenant_connect(self, tenant: Union[str, URL]) -> PoolProxiedConnection:
+        """Return a DBAPI connection from the pool, accounted against
+        the given tenant's quota.
+
+        If a quota was configured for the tenant via
+        :meth:`.QueuePool.tenant_set_quota` and the tenant already holds
+        that many connections, the checkout waits, up to the pool's
+        configured ``timeout``, for the tenant to return a connection;
+        other tenants are not affected by this wait.  The ``timeout``
+        is a single deadline shared by the quota wait and the regular
+        pool wait that follows it; it is not restarted.
+
+        If no quota is configured for the tenant, this method behaves
+        exactly like :meth:`.Pool.connect`.
+
+        :param tenant: the tenant identifier, as a string or as a
+         :class:`_engine.URL` from which the identifier is derived via
+         :meth:`.QueuePool.tenant_from_url`.
+
+        """
+        return _ConnectionFairy._checkout(
+            self, _tenant=self._tenant_id(tenant)
+        )
+
+    def connect(
+        self, tenant: Optional[Union[str, URL]] = None
+    ) -> PoolProxiedConnection:
+        """Return a DBAPI connection from the pool.
+
+        The connection is instrumented such that when its
+        ``close()`` method is called, the connection will be returned to
+        the pool.
+
+        :param tenant: if given, the checkout is accounted against this
+         tenant's quota, exactly as if :meth:`.QueuePool.tenant_connect`
+         were called.  When omitted, the checkout behaves exactly as
+         :meth:`.Pool.connect`.
+
+        """
+        if tenant is None:
+            return super().connect()
+        else:
+            return self.tenant_connect(tenant)
+
     def recreate(self) -> QueuePool:
         self.logger.info("Pool recreating")
-        return self.__class__(
+        new_pool = self.__class__(
             self._creator,
             pool_size=self._pool.maxsize,
             max_overflow=self._max_overflow,
@@ -214,6 +457,9 @@ class QueuePool(Pool):
             _dispatch=self.dispatch,
             dialect=self._dialect,
         )
+        with self._tenant_condition:
+            new_pool._tenant_quotas.update(self._tenant_quotas)
+        return new_pool
 
     def dispose(self) -> None:
         while True:

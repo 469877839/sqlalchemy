@@ -592,6 +592,96 @@ Note that the flag only applies to :class:`.QueuePool` use.
     :ref:`pool_disconnects`
 
 
+.. _pool_tenant_quotas:
+
+Per-Tenant Connection Quotas
+----------------------------
+
+When a single :class:`.QueuePool` is shared by a multi-tenant
+application, one tenant can occupy every connection in the pool and
+starve the others, whose checkouts then wait until they time out.
+To guard against this, :class:`.QueuePool` supports optional
+**per-tenant quotas** that cap how many connections a single tenant
+may hold at the same time.  The overall capacity of the pool is
+unchanged: it remains ``pool_size + max_overflow``, shared by all
+tenants.
+
+Tenant quotas are disabled by default.  When no quota is configured,
+checkout and checkin use exactly the same code paths as a pool without
+the feature, and tenants that have no quota configured are likewise
+completely unaffected.
+
+**Deriving the tenant identifier.**  A tenant is identified by a
+string.  The recommended way to produce this string is to derive it
+from the tenant's connection URL using
+:meth:`.QueuePool.tenant_from_url`, which joins the URL's
+``username``, ``host``, ``port`` and ``database`` attributes as
+``"<username>@<host>:<port>/<database>"``.  Components that are not
+present render as empty strings; the password, the drivername and the
+query string are deliberately excluded, so that no secrets leak into
+identifiers and URLs that differ only by driver or query parameters
+still map to the same tenant.  For example,
+``postgresql+psycopg2://scott:tiger@dbhost:5432/tenant_a?sslmode=require``
+derives to ``"scott@dbhost:5432/tenant_a"``.
+
+**Configuring and querying quotas.**  All quota related methods carry
+a ``tenant_`` prefix:
+
+* :meth:`.QueuePool.tenant_set_quota` - set (or, with ``None``,
+  remove) the quota for a tenant
+* :meth:`.QueuePool.tenant_get_quota` - return the quota for a tenant
+* :meth:`.QueuePool.tenant_quotas` - return all configured quotas
+* :meth:`.QueuePool.tenant_usage` - return the number of connections
+  currently checked out by a tenant (tracked only for tenants that
+  have a quota)
+
+**Checking out.**  Use :meth:`.QueuePool.tenant_connect`, or pass the
+``tenant`` argument to :meth:`.QueuePool.connect`; both accept either
+a tenant string or a :class:`_engine.URL` from which the identifier is
+derived::
+
+    pool = QueuePool(creator, pool_size=10, max_overflow=5, timeout=30)
+    pool.tenant_set_quota("scott@dbhost:5432/tenant_a", 3)
+
+    conn = pool.tenant_connect(tenant_url)   # quota enforced
+    other = pool.connect()                   # unaffected, as before
+
+**Behavior when the quota is exhausted.**  A checkout for a tenant
+that is at its quota does *not* enter the pool's regular FIFO wait
+queue.  Instead it waits on a separate per-pool condition until the
+tenant returns a connection or the checkout times out.  This means a
+tenant that has exhausted its quota can never hold up the checkouts of
+other tenants behind it in the queue.  The trade-off is that waiters
+of the *same* tenant are woken collectively (``notify_all``) and
+re-contend for the freed slot, so same-tenant waiters are served
+roughly, not strictly, in arrival order; cross-tenant ordering is
+unaffected.  Quota accounting is performed inside the pool's critical
+section: the decision and the bookkeeping are atomic with respect to
+other checkouts and checkins.
+
+**Timeout semantics.**  The pool's ``timeout`` is a single deadline
+for the whole checkout.  Time spent waiting for the tenant's quota is
+*not* re-budgeted: if the quota wait ends and the checkout then has to
+wait for a pooled connection, only the remaining time is available.
+A checkout never waits longer than ``timeout`` in total, and it is
+never sent to the back of a queue to start a fresh wait.  When the
+deadline expires while waiting for the quota, a
+:class:`_exc.TimeoutError` is raised that names the tenant and the
+quota; when it expires while waiting for a pooled connection, the
+regular pool timeout error is raised.
+
+**Returning connections.**  Returning a connection to the pool
+releases the tenant's quota slot immediately and wakes the tenant's
+waiters.  This applies to all the ways a connection leaves the
+checked-out state: a normal ``close()``, invalidation, recycling of a
+stale connection, and finalization of a connection that was garbage
+collected without being closed.
+
+.. note:: Per-tenant quotas are only supported by the synchronous
+   :class:`.QueuePool`.  The asyncio-compatible
+   :class:`.AsyncAdaptedQueuePool` does not support them.
+
+
 .. _pooling_multiprocessing:
 
 Using Connection Pools with Multiprocessing or os.fork()

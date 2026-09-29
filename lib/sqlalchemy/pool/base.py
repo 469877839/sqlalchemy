@@ -458,6 +458,15 @@ class Pool(log.Identified, event.EventTarget):
 
         raise NotImplementedError()
 
+    def _do_get_tenant(self, tenant: str) -> ConnectionPoolEntry:
+        """Implementation for a tenant-scoped checkout, supplied by
+        subclasses that support per-tenant quotas."""
+
+        raise NotImplementedError(
+            "Per-tenant connection quotas are not supported by %s"
+            % type(self).__name__
+        )
+
     def _do_return_conn(self, record: ConnectionPoolEntry) -> None:
         """Implementation for :meth:`return_conn`, supplied by subclasses."""
 
@@ -702,8 +711,12 @@ class _ConnectionRecord(ConnectionPoolEntry):
         return {}
 
     @classmethod
-    def checkout(cls, pool: Pool) -> _ConnectionFairy:
-        if TYPE_CHECKING:
+    def checkout(
+        cls, pool: Pool, _tenant: Optional[str] = None
+    ) -> _ConnectionFairy:
+        if _tenant is not None:
+            rec = cast(_ConnectionRecord, pool._do_get_tenant(_tenant))
+        elif TYPE_CHECKING:
             rec = cast(_ConnectionRecord, pool._do_get())
         else:
             rec = pool._do_get()
@@ -1282,9 +1295,10 @@ class _ConnectionFairy(PoolProxiedConnection):
         pool: Pool,
         threadconns: Optional[threading.local] = None,
         fairy: Optional[_ConnectionFairy] = None,
+        _tenant: Optional[str] = None,
     ) -> _ConnectionFairy:
         if not fairy:
-            fairy = _ConnectionRecord.checkout(pool)
+            fairy = _ConnectionRecord.checkout(pool, _tenant=_tenant)
 
             if threadconns is not None:
                 threadconns.current = weakref.ref(fairy)
